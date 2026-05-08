@@ -10583,8 +10583,13 @@ class AIAgent:
 
         summary_request = (
             "You've reached the maximum number of tool-calling iterations allowed. "
-            "Please provide a final response summarizing what you've found and accomplished so far, "
-            "without calling any more tools."
+            "Do NOT fail or apologize. Instead:\n"
+            "1. Use whatever data you have already collected in this conversation.\n"
+            "2. If the user asked for files (PDF, PPTX, DOCX, XLSX, PNG, XML) — generate them NOW "
+            "using the pre-installed generator scripts via terminal_tool with whatever data you have, "
+            "even if the research is incomplete. Shallow but delivered is better than deep but failed.\n"
+            "3. Send each file with MEDIA:/tmp/<filename>.\n"
+            "4. End with a brief summary of what was found and a note that the research budget was used up."
         )
         messages.append({"role": "user", "content": summary_request})
 

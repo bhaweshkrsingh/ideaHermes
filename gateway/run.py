@@ -191,6 +191,41 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def _gemini_translate(text: str, target_language: str) -> str:
+    """Translate text to target_language using Gemini (module-level, safe for to_thread)."""
+    try:
+        from google import genai as _gai
+    except ImportError:
+        return text
+    import os as _os_tr
+    _hermes_home = _os_tr.environ.get("HERMES_HOME", _os_tr.path.expanduser("~/.hermes"))
+    _api_key = _os_tr.environ.get("GEMINI_API_KEY", "")
+    if not _api_key:
+        try:
+            with open(_os_tr.path.join(_hermes_home, ".env")) as _ef:
+                for _ln in _ef:
+                    if _ln.strip().startswith("GEMINI_API_KEY="):
+                        _api_key = _ln.strip().split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+    if not _api_key:
+        return text
+    _script_hint = "Devanagari script (देवनागरी)" if target_language.lower() == "hindi" else "native script"
+    _prompt = (
+        f"Translate the following text to {target_language}. "
+        f"Use {_script_hint}. "
+        "Return ONLY the translated text, no explanations or extra text.\n\n"
+        f"{text[:3000]}"
+    )
+    _client = _gai.Client(api_key=_api_key)
+    _resp = _client.models.generate_content(
+        model="gemini-3.1-flash-lite",
+        contents=[_prompt],
+    )
+    return (_resp.text or "").strip() or text
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -6161,7 +6196,7 @@ class GatewayRunner:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = (event.text or "").replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -9055,6 +9090,17 @@ class GatewayRunner:
         import uuid as _uuid
         audio_path = None
         actual_path = None
+        # Translate English LLM response → original voice language before TTS
+        _tts_target_lang = getattr(self, '_last_voice_target_lang', None)
+        self._last_voice_target_lang = None
+        if _tts_target_lang and _tts_target_lang.lower() != "english":
+            try:
+                text = await asyncio.to_thread(
+                    _gemini_translate, text, _tts_target_lang
+                )
+                logger.info("Translated LLM response to %s for TTS", _tts_target_lang)
+            except Exception as _tr_err:
+                logger.warning("Pre-TTS translation failed, using original: %s", _tr_err)
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -12039,9 +12085,19 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    detected_lang = result.get("language", "")
+                    translation = result.get("translation", "") or transcript
+                    # Store original language for post-LLM translation + TTS
+                    self._last_detected_language = detected_lang or None
+                    # Store English translation for pre-search + Qwen query
+                    self._last_translation = translation
+                    self._last_transcript = transcript  # kept for logging only
+                    # Send English translation to Qwen — Qwen always answers in English
+                    _lang_note = f" (original language: {detected_lang})" if detected_lang else ""
                     enriched_parts.append(
-                        f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
+                        f'[Voice message{_lang_note}]\n'
+                        f'Original transcript: "{transcript}"\n'
+                        f'English query: "{translation}"'
                     )
                 else:
                     error = result.get("error", "unknown error")
@@ -13681,6 +13737,35 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            # Inject today's date and mandatory search directive.
+            from datetime import datetime as _dt
+            _today_str = _dt.now().strftime('%Y-%m-%d')
+            _search_mandate = (
+                f"TODAY IS {_today_str}. "
+                "Your training data is a past snapshot — you do not know current facts. "
+                "For ANY question about who holds a position (CM, PM, minister, CEO, president, "
+                "coach, captain, etc.), current news, prices, scores, or any fact that changes "
+                f"over time: call web_search FIRST using '{_today_str}' in the query. "
+                f"Example: 'Chief Minister Bihar as of {_today_str}'. "
+                "Do NOT answer from memory — your memory is wrong for current-state facts. "
+                "Searching is not optional. It is how you get the correct answer."
+            )
+            combined_ephemeral = (_search_mandate + "\n\n" + combined_ephemeral).strip()
+
+            # Carry detected voice language forward to _send_voice_reply for
+            # post-LLM translation (English → original language) before TTS.
+            # Bhojpuri/Maithili → Hindi: Gemini TTS supports Hindi natively.
+            _voice_lang = getattr(self, '_last_detected_language', None)
+            self._last_detected_language = None
+            if _voice_lang and _voice_lang.lower() != "english":
+                _tts_lang = "Hindi" if _voice_lang.lower() in ("bhojpuri", "maithili") else _voice_lang
+                self._last_voice_target_lang = _tts_lang
+            else:
+                self._last_voice_target_lang = None
+
+            # Clear voice translation state — agent decides its own tools from here.
+            self._last_translation = None
+            self._last_transcript = None
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for

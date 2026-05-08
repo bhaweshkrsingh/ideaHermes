@@ -73,6 +73,7 @@ def _safe_find_spec(module_name: str) -> bool:
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
 _HAS_MISTRAL = _safe_find_spec("mistralai")
+_HAS_GOOGLE_GENAI = _safe_find_spec("google.genai")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -84,6 +85,7 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_GEMINI_STT_MODEL = os.getenv("STT_GEMINI_MODEL", "gemini-3-flash-preview")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -268,6 +270,16 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "gemini":
+            gemini_cfg = stt_config.get("gemini", {})
+            if _HAS_GOOGLE_GENAI and (gemini_cfg.get("api_key") or get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")):
+                return "gemini"
+            logger.warning(
+                "STT provider 'gemini' configured but google-genai not installed "
+                "or no API key found (set GEMINI_API_KEY or stt.gemini.api_key)"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
     # --- Auto-detect (no explicit provider): local > groq > openai > mistral > xai -
@@ -288,6 +300,10 @@ def _get_provider(stt_config: dict) -> str:
     if get_env_value("XAI_API_KEY"):
         logger.info("No local STT available, using xAI Grok STT API")
         return "xai"
+    _gemini_key = get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")
+    if _HAS_GOOGLE_GENAI and _gemini_key:
+        logger.info("No local STT available, using Gemini Flash STT API")
+        return "gemini"
     return "none"
 
 # ---------------------------------------------------------------------------
@@ -786,6 +802,195 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+
+# ---------------------------------------------------------------------------
+# Provider: gemini (Google Gemini Flash — free via AI Studio)
+# ---------------------------------------------------------------------------
+
+_BHOJPURI_EXCLUSIVE = {
+    "रउआ", "रउवा", "रउरा", "बाड़ऊ", "बाड़े", "बाटे", "बतावृ", "बताब",
+    "हउवे", "हउ", "काहे", "बानी", "बाड़ा", "कहाँ बाड़े", "बताव",
+}
+_MAITHILI_EXCLUSIVE = {
+    "अहाँ", "छी", "छैक", "हौ", "अछि", "केँ", "हमरा", "छलहुँ",
+    "छलाह", "कहू", "केहन", "छन्हि", "छथि", "अपने",
+}
+
+
+def _count_exclusive_markers(transcript: str, markers: set) -> int:
+    count = 0
+    for marker in markers:
+        if marker in transcript:
+            count += 1
+    return count
+
+
+def _verify_bhojpuri_maithili(client, model_name: str, transcript: str, gemini_lang: str) -> str:
+    bhojpuri_score = _count_exclusive_markers(transcript, _BHOJPURI_EXCLUSIVE)
+    maithili_score = _count_exclusive_markers(transcript, _MAITHILI_EXCLUSIVE)
+
+    if bhojpuri_score == 0 and maithili_score == 0:
+        return gemini_lang
+
+    if bhojpuri_score > maithili_score:
+        marker_lang = "Bhojpuri"
+    elif maithili_score > bhojpuri_score:
+        marker_lang = "Maithili"
+    else:
+        return gemini_lang
+
+    if marker_lang.lower() == gemini_lang.lower():
+        return gemini_lang
+
+    logger.info(
+        "Marker check disagrees with Gemini (Gemini=%s, markers=%s, B:%d M:%d) — retrying with text",
+        gemini_lang, marker_lang, bhojpuri_score, maithili_score,
+    )
+    try:
+        retry_prompt = (
+            "Identify whether the following text is written in Bhojpuri or Maithili. "
+            "These are different languages. "
+            "Bhojpuri exclusive markers: रउआ/रउवा/बाड़ऊ/बाटे/बतावृ/बताब/हउवे/काहे. "
+            "Maithili exclusive markers: अहाँ/छी/छैक/हौ/अछि/केँ/हमरा/छलहुँ/केहन/छथि. "
+            f"Reply with exactly one word: Bhojpuri or Maithili.\n\nText: {transcript}"
+        )
+        retry_response = client.models.generate_content(model=model_name, contents=[retry_prompt])
+        retry_raw = (retry_response.text or "").strip().replace("**", "")
+        for word in retry_raw.split():
+            if word.lower() in ("bhojpuri", "maithili"):
+                return word.capitalize()
+        return marker_lang
+    except Exception as e:
+        logger.warning("Gemini language retry failed (%s) — using marker winner: %s", e, marker_lang)
+        return marker_lang
+
+
+def _transcribe_gemini(file_path: str, model_name: str) -> Dict[str, Any]:
+    if not _HAS_GOOGLE_GENAI:
+        return {"success": False, "transcript": "", "error": "google-genai package not installed"}
+
+    stt_config = _load_stt_config()
+    gemini_cfg = stt_config.get("gemini", {})
+    api_key = (
+        gemini_cfg.get("api_key")
+        or get_env_value("GEMINI_API_KEY")
+        or get_env_value("GOOGLE_API_KEY")
+    )
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "No Gemini API key found."}
+
+    audio_path = Path(file_path)
+    mime_map = {
+        ".mp3": "audio/mpeg", ".mp4": "audio/mp4", ".mpeg": "audio/mpeg",
+        ".mpga": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
+        ".webm": "audio/webm", ".ogg": "audio/ogg", ".aac": "audio/aac",
+        ".flac": "audio/flac",
+    }
+    mime_type = mime_map.get(audio_path.suffix.lower(), "audio/ogg")
+
+    try:
+        import base64
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+
+        with open(file_path, "rb") as f:
+            audio_bytes = f.read()
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        prompt = (
+            "Listen to this audio carefully and do three things:\n"
+            "1. Identify the spoken language. The audio may be in any language. "
+            "Return the full language name in English (e.g. English, Hindi, Spanish, Italian, French, Arabic, Urdu, etc.). "
+            "If the audio contains Hindi, Maithili, or Bhojpuri, be precise — they are different languages, not dialects. "
+            "Maithili uses words like हमरा/अहाँ/छी/हौ. Bhojpuri uses words like हम/रउरा/बा/रहल. "
+            "Hindi uses standard words like मैं/आप/है/हैं.\n"
+            "2. Transcribe the audio exactly as spoken, using the language's native script. "
+            "Use Devanagari for Hindi, Maithili, Bhojpuri. "
+            "Use Arabic script for Arabic and Urdu. "
+            "Use Latin script for all other languages (English, Spanish, Italian, French, German, etc.).\n"
+            "3. Translate the transcript to English. "
+            "If the audio is already in English, repeat the transcript as-is.\n\n"
+            "Respond in exactly this format (no other text):\n"
+            "LANGUAGE: <language name in English>\n"
+            "TRANSCRIPT: <transcribed text in original language/script>\n"
+            "TRANSLATION: <English translation (same as transcript if English)>"
+        )
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_bytes(data=base64.b64decode(audio_b64), mime_type=mime_type),
+                prompt,
+            ],
+        )
+
+        raw = response.text.strip() if response.text else ""
+        if not raw:
+            return {"success": False, "transcript": "", "error": "Gemini returned empty response"}
+
+        detected_language = ""
+        transcript_text = ""
+        translation_text = ""
+        for line in raw.splitlines():
+            clean = line.replace("**", "").strip()
+            if clean.startswith("LANGUAGE:"):
+                detected_language = clean[len("LANGUAGE:"):].strip()
+            elif clean.startswith("TRANSCRIPT:"):
+                transcript_text = clean[len("TRANSCRIPT:"):].strip()
+            elif clean.startswith("TRANSLATION:"):
+                translation_text = clean[len("TRANSLATION:"):].strip()
+
+        if not transcript_text:
+            transcript_text = raw
+
+        # Fallback: if Gemini returned no LANGUAGE line, classify from transcript text.
+        if not detected_language and transcript_text:
+            try:
+                fallback_prompt = (
+                    "What language is the following text written in? "
+                    "Reply with exactly one word or short name in English "
+                    "(e.g. English, Hindi, Spanish, Italian, French, Arabic, Urdu, Maithili, Bhojpuri, etc.).\n\n"
+                    f"Text: {transcript_text[:300]}"
+                )
+                fb_resp = client.models.generate_content(
+                    model=model_name, contents=[fallback_prompt]
+                )
+                fb_text = (fb_resp.text or "").strip().strip("*").strip()
+                if fb_text and len(fb_text) <= 40 and fb_text.replace("-", "").replace(" ", "").isalpha():
+                    detected_language = fb_text.capitalize()
+                    logger.info("Language fallback detected: %s", detected_language)
+            except Exception as _fb_err:
+                logger.warning("Language fallback detection failed: %s", _fb_err)
+
+        if detected_language.lower() in ("bhojpuri", "maithili"):
+            detected_language = _verify_bhojpuri_maithili(
+                client, model_name, transcript_text, detected_language
+            )
+
+        logger.info(
+            "Transcribed %s via Gemini (%s, lang=%s, %d chars)",
+            audio_path.name, model_name, detected_language or "unknown", len(transcript_text),
+        )
+        # If no translation returned by model, fall back: English = same as transcript
+        if not translation_text:
+            if detected_language.lower() == "english":
+                translation_text = transcript_text
+        result: Dict[str, Any] = {"success": True, "transcript": transcript_text, "provider": "gemini"}
+        if detected_language:
+            result["language"] = detected_language
+        if translation_text:
+            result["translation"] = translation_text
+        return result
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("Gemini transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Gemini transcription failed: {e}"}
+
+
 def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
@@ -854,6 +1059,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "gemini":
+        gemini_cfg = stt_config.get("gemini", {})
+        model_name = model or gemini_cfg.get("model", DEFAULT_GEMINI_STT_MODEL)
+        return _transcribe_gemini(file_path, model_name)
+
     # No provider available
     return {
         "success": False,
@@ -861,7 +1071,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         "error": (
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
-            "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
+            "set GROQ_API_KEY for free Groq Whisper, set GEMINI_API_KEY for free Gemini Flash STT "
+            "(supports English/Hindi/Maithili/Bhojpuri), set MISTRAL_API_KEY for Mistral "
             "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),

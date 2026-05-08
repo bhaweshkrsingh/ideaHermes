@@ -126,7 +126,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs"):
+    if configured in ("parallel", "firecrawl", "serper", "tavily", "exa", "searxng", "brave-free", "ddgs"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -137,6 +137,7 @@ def _get_backend() -> str:
     backend_candidates = (
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
+        ("serper", _has_env("GOOGLE_SERPER_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("searxng", _has_env("SEARXNG_URL")),
@@ -196,6 +197,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("PARALLEL_API_KEY")
     if backend == "firecrawl":
         return check_firecrawl_api_key()
+    if backend == "serper":
+        return _has_env("GOOGLE_SERPER_API_KEY")
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
     if backend == "searxng":
@@ -1137,6 +1140,40 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+_SERPER_BASE_URL = "https://google.serper.dev"
+
+
+def _serper_search(query: str, limit: int = 10) -> dict:
+    """Call the Serper.dev Google Search API and return normalised results."""
+    import urllib.request as _urllib_request
+    api_key = os.environ.get("GOOGLE_SERPER_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GOOGLE_SERPER_API_KEY not set")
+    payload = json.dumps({"q": query, "num": min(limit, 10)}).encode()
+    req = _urllib_request.Request(
+        f"{_SERPER_BASE_URL}/search",
+        data=payload,
+        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+    )
+    with _urllib_request.urlopen(req, timeout=20) as resp:
+        raw = json.loads(resp.read().decode())
+    results = []
+    for item in (raw.get("organic") or [])[:limit]:
+        results.append({
+            "title": item.get("title", ""),
+            "url": item.get("link", ""),
+            "description": item.get("snippet", ""),
+        })
+    knowledge_graph = raw.get("knowledgeGraph", {})
+    if knowledge_graph.get("description"):
+        results.insert(0, {
+            "title": knowledge_graph.get("title", "Knowledge Graph"),
+            "url": knowledge_graph.get("descriptionLink", ""),
+            "description": knowledge_graph.get("description", ""),
+        })
+    return {"success": True, "data": {"web": results[:limit]}}
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -1239,6 +1276,14 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "serper":
+            logger.info("Serper (Google) search: '%s' (limit: %d)", query, limit)
+            response_data = _serper_search(query, limit)
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
             return result_json
