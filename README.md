@@ -179,3 +179,113 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+---
+
+## Local WSL2 Setup — ideaHermes (bhaweshkrsingh)
+
+This fork runs Hermes v0.13.0 on a Windows 11 PC via WSL2 (Ubuntu) with the following customisations on top of the upstream codebase.
+
+### Architecture — Hub-and-Spoke English Pipeline
+
+```
+Audio → Gemini STT → { LANGUAGE, TRANSCRIPT, TRANSLATION(EN) }
+                              ↓
+              English translation → Qwen LLM (always English)
+                              ↓
+          if original ≠ English: Gemini translate(answer → original lang)
+                              ↓
+              translated text (or English) → Gemini TTS → Telegram audio
+```
+
+All LLM reasoning and web search happens in English regardless of the users
+
+
+---
+
+## Local WSL2 Setup — ideaHermes (bhaweshkrsingh)
+
+This fork runs Hermes v0.13.0 on a Windows 11 PC via WSL2 (Ubuntu) with the following customisations on top of the upstream codebase.
+
+### Architecture — Hub-and-Spoke English Pipeline
+
+```
+Audio → Gemini STT → { LANGUAGE, TRANSCRIPT, TRANSLATION(EN) }
+                              ↓
+              English translation → Qwen LLM (always English)
+                              ↓
+          if original ≠ English: Gemini translate(answer → original lang)
+                              ↓
+              translated text (or English) → Gemini TTS → Telegram audio
+```
+
+All LLM reasoning and web search happens in English regardless of the user's input language. Gemini handles translation in both directions.
+
+### Language Support
+
+| Input | STT detects | Qwen receives | TTS in |
+|-------|-------------|---------------|--------|
+| English audio | English | English | English |
+| Hindi audio | Hindi | English | Hindi (Devanagari) |
+| Bhojpuri audio | Bhojpuri | English | Hindi (Devanagari) |
+| Maithili audio | Maithili | English | Hindi (Devanagari) |
+| English text | N/A | English | (no TTS) |
+
+### Key Files Changed
+
+| File | Change |
+|------|--------|
+| `tools/transcription_tools.py` | Gemini STT returning LANGUAGE + TRANSCRIPT + TRANSLATION; any-language support; Bhojpuri/Maithili disambiguation hints |
+| `tools/web_tools.py` | Serper (Google real-time) search backend via `GOOGLE_SERPER_API_KEY` |
+| `gateway/run.py` | Hub-and-spoke pipeline; `_gemini_translate()` helper; `_last_voice_target_lang` routing; `_search_mandate` capability-gap framing |
+| `run_agent.py` | Max-turns summary prompt improved |
+| `gateway/platforms/telegram.py` | `HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT` env var support |
+
+### Document Generation Scripts
+
+All scripts read `/tmp/papers.json` and output to `/tmp/`.
+
+| Script | Output | Library |
+|--------|--------|---------|
+| `scripts/gen_papers_pdf.py` | `ai-papers-summary.pdf` | reportlab |
+| `scripts/gen_papers_pptx.py` | `ai-papers-gist.pptx` | python-pptx |
+| `scripts/gen_docx.py` | `ai-papers-summary.docx` | python-docx |
+| `scripts/gen_xlsx.py` | `ai-papers-summary.xlsx` | openpyxl |
+| `scripts/gen_msproj.py` | `ai-project-plan.xml` | pure XML MSPDI |
+| `scripts/gen_mermaid_png.py` | `mermaid-diagram.png` | mermaid.ink API (mmdc fallback) |
+
+See `.hermes/skills/productivity/research-to-documents/SKILL.md` for agent usage instructions.
+
+### Models
+
+| Role | Model |
+|------|-------|
+| LLM | Qwen 3.6-35B nvfp4 (NVIDIA NIM) |
+| STT | `gemini-3.1-flash-lite` |
+| TTS | `gemini-3.1-flash-tts-preview` (voice: Aoede) |
+| Translation | `gemini-3.1-flash-lite` |
+| Web search | Serper.dev (Google real-time) |
+
+### Service Management
+
+```bash
+# Status
+sudo -u hermes XDG_RUNTIME_DIR=/run/user/$(id -u hermes) systemctl --user status hermes-gateway.service
+
+# Restart
+sudo -u hermes XDG_RUNTIME_DIR=/run/user/$(id -u hermes) systemctl --user restart hermes-gateway.service
+
+# Logs (live)
+sudo -u hermes XDG_RUNTIME_DIR=/run/user/$(id -u hermes) journalctl --user -u hermes-gateway.service -f
+```
+
+### Windows Auto-Start After Reboot
+
+WSL2 + Hermes starts automatically after Windows login via Task Scheduler:
+
+```cmd
+REM Run once from CMD as Administrator
+schtasks /Create /TN "Hermes WSL Autostart" /TR "wsl.exe -d Ubuntu" /SC ONLOGON /RU b_k_s /F
+```
+
+Chain: Windows login → Task Scheduler starts `wsl.exe -d Ubuntu` → systemd starts → `linger=yes` on hermes user → `hermes-gateway.service` auto-starts.
