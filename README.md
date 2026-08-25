@@ -211,11 +211,11 @@ This fork runs Hermes v0.13.0 on a Windows 11 PC via WSL2 (Ubuntu) with the foll
 
 ```
 Audio → Gemini STT → { LANGUAGE, TRANSCRIPT, TRANSLATION(EN) }
-                              ↓
-              English translation → Qwen LLM (always English)
-                              ↓
+                      ↓
+      English translation → Qwen LLM (always English)
+                      ↓
           if original ≠ English: Gemini translate(answer → original lang)
-                              ↓
+                      ↓
               translated text (or English) → Gemini TTS → Telegram audio
 ```
 
@@ -240,6 +240,20 @@ All LLM reasoning and web search happens in English regardless of the user's inp
 | `gateway/run.py` | Hub-and-spoke pipeline; `_gemini_translate()` helper; `_last_voice_target_lang` routing; `_search_mandate` capability-gap framing |
 | `run_agent.py` | Max-turns summary prompt improved |
 | `gateway/platforms/telegram.py` | `HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT` env var support |
+
+### Custom STT & TTS Extensions
+
+Custom voice enhancements were contributed to this fork — replacing default providers with Google's latest models:
+
+| Role | Original | Custom Contribution |
+|------|----------|--------------------||
+| STT | local faster-whisper / Groq | **`gemini-3.1-flash-lite`** — latest Google Gemini STT for better Hindi, Bhojpuri, and Maithili recognition |
+| TTS | Edge TTS (default) | **`gemini-3.1-flash-tts-preview`** (voice: Aoede) — latest Google TTS model with natural-sounding multi-language output |
+| Translation | N/A | **`gemini-3.1-flash-lite`** — bidirectional translation between user's language and English for reasoning |
+
+These extensions give Hermes native support for spoken **Hindi, Bhojpuri, and Maithili** — not just typed input. Voice messages in any of these languages are transcribed with high accuracy, processed in English, and spoken back in the user's language.
+
+> **Contributed by Bhawesh Singh** — Principal Agentic AI Engineer. These custom audio extensions were added in his spare time as an open-source contributor to the Hermes codebase.
 
 ### Document Generation Scripts
 
