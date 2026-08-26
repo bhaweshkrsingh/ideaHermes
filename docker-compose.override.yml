@@ -1,0 +1,36 @@
+# Local override for macOS Docker Desktop, two changes from the vendor file:
+#
+# 1. Data volume scoped to the Hermes project folder on this Mac (mirrors
+#    the Windows/WSL setup's "container only sees C:\Hermes" restriction)
+#    instead of the vendor default ~/.hermes.
+#
+# 2. network_mode: host is dropped. Verified live 2026-08-26: Docker
+#    Desktop for Mac's "host" network is the internal Linux VM's network,
+#    NOT actually the Mac's real network namespace (a container bound to
+#    --network host on a port was unreachable from a real `curl`/`nc` on
+#    the Mac itself). This works fine on native Linux/WSL2 but silently
+#    doesn't on Mac -- so instead use normal bridge networking with an
+#    explicit port publish for the dashboard (127.0.0.1-only, matching the
+#    vendor compose file's own security note that it must never be exposed
+#    beyond localhost). The gateway needs no published port for Telegram --
+#    that's outbound long-polling, not an inbound listener.
+services:
+  gateway:
+    network_mode: !reset null
+    volumes:
+      - /Users/bhaweshsingh/Hermes/data:/opt/data
+  dashboard:
+    network_mode: !reset null
+    # The vendor command binds the dashboard to 127.0.0.1 *inside* the
+    # container, which is fine under network_mode: host (that IS the Mac's
+    # loopback there) but is unreachable through bridge+port-publish: the
+    # published port forwards to the container's bridge interface, not its
+    # loopback, so a same-namespace `docker exec curl` succeeded while a
+    # real Mac curl got "Empty reply from server" (verified 2026-08-26).
+    # Bind to 0.0.0.0 inside the container instead; the 127.0.0.1-only host
+    # publish below still keeps it unreachable from the LAN.
+    command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+    ports:
+      - "127.0.0.1:9119:9119"
+    volumes:
+      - /Users/bhaweshsingh/Hermes/data:/opt/data
