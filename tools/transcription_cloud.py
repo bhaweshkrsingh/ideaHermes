@@ -446,8 +446,14 @@ def _extract_transcript_text(transcription: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Provider: gemini (Google Gemini Flash — free via AI Studio)
+# Provider: gemini (Google Gemini Flash -- ideaHermes addition)
+#
+# Plain REST (httpx), NOT the google-genai SDK: the Hermes image does not ship the SDK and lazy installs are disabled, so an
+# SDK import would silently make this provider unavailable. Returns transcript + detected language + English translation
+# (the gateway answers in English and translates back before TTS).
 # ---------------------------------------------------------------------------
+
+GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 _BHOJPURI_EXCLUSIVE = {
     "रउआ", "रउवा", "रउरा", "बाड़ऊ", "बाड़े", "बाटे", "बतावृ", "बताब",
@@ -459,15 +465,33 @@ _MAITHILI_EXCLUSIVE = {
 }
 
 
+def gemini_api_key() -> str:
+    """stt.gemini.api_key > GEMINI_API_KEY > GOOGLE_API_KEY (config, then env / .env)."""
+    from tools.transcription_tools import _load_stt_config
+    from hermes_cli.config import get_env_value
+    cfg = _get_stt_section(_load_stt_config(), "gemini")
+    return str(cfg.get("api_key") or get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY") or "")
+
+
+def gemini_generate_text(api_key: str, model: str, parts: list, timeout: float = 60.0) -> str:
+    """One Gemini generateContent call over REST; returns the response text ('' when empty). Raises on HTTP errors."""
+    import httpx
+    resp = httpx.post(
+        f"{GEMINI_REST_BASE}/models/{model}:generateContent",
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        json={"contents": [{"parts": parts}]}, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:200]}")
+    cands = resp.json().get("candidates") or []
+    parts_out = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+    return "".join(p.get("text", "") for p in parts_out).strip()
+
+
 def _count_exclusive_markers(transcript: str, markers: set) -> int:
-    count = 0
-    for marker in markers:
-        if marker in transcript:
-            count += 1
-    return count
+    return sum(1 for marker in markers if marker in transcript)
 
 
-def _verify_bhojpuri_maithili(client, model_name: str, transcript: str, gemini_lang: str) -> str:
+def _verify_bhojpuri_maithili(api_key: str, model_name: str, transcript: str, gemini_lang: str) -> str:
     bhojpuri_score = _count_exclusive_markers(transcript, _BHOJPURI_EXCLUSIVE)
     maithili_score = _count_exclusive_markers(transcript, _MAITHILI_EXCLUSIVE)
 
@@ -496,8 +520,7 @@ def _verify_bhojpuri_maithili(client, model_name: str, transcript: str, gemini_l
             "Maithili exclusive markers: अहाँ/छी/छैक/हौ/अछि/केँ/हमरा/छलहुँ/केहन/छथि. "
             f"Reply with exactly one word: Bhojpuri or Maithili.\n\nText: {transcript}"
         )
-        retry_response = client.models.generate_content(model=model_name, contents=[retry_prompt])
-        retry_raw = (retry_response.text or "").strip().replace("**", "")
+        retry_raw = gemini_generate_text(api_key, model_name, [{"text": retry_prompt}]).replace("**", "")
         for word in retry_raw.split():
             if word.lower() in ("bhojpuri", "maithili"):
                 return word.capitalize()
@@ -510,21 +533,12 @@ def _verify_bhojpuri_maithili(client, model_name: str, transcript: str, gemini_l
 def _transcribe_gemini(
     file_path: str, model_name: str, *, language: Optional[str] = None, prompt: Optional[str] = None
 ) -> Dict[str, Any]:
-    """ideaHermes Gemini STT: transcript + detected language + English translation (the gateway answers in English
-    and translates back before TTS). ``language``/``prompt`` are accepted for dispatcher parity; Gemini detects the language itself."""
-    from tools.transcription_tools import _HAS_GOOGLE_GENAI, _load_stt_config
-    from hermes_cli.config import get_env_value
-    if not _HAS_GOOGLE_GENAI:
-        return {"success": False, "transcript": "", "error": "google-genai package not installed"}
-
-    gemini_cfg = _get_stt_section(_load_stt_config(), "gemini")
-    api_key = (
-        gemini_cfg.get("api_key")
-        or get_env_value("GEMINI_API_KEY")
-        or get_env_value("GOOGLE_API_KEY")
-    )
+    """ideaHermes Gemini STT: transcript + detected language + English translation. ``language``/``prompt`` are accepted
+    for dispatcher parity; Gemini detects the language itself."""
+    import base64
+    api_key = gemini_api_key()
     if not api_key:
-        return {"success": False, "transcript": "", "error": "No Gemini API key found."}
+        return {"success": False, "transcript": "", "error": "No Gemini API key found (set GEMINI_API_KEY or stt.gemini.api_key)."}
 
     audio_path = Path(file_path)
     mime_map = {
@@ -536,17 +550,10 @@ def _transcribe_gemini(
     mime_type = mime_map.get(audio_path.suffix.lower(), "audio/ogg")
 
     try:
-        import base64
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
-
         with open(file_path, "rb") as f:
-            audio_bytes = f.read()
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            audio_b64 = base64.b64encode(f.read()).decode("ascii")
 
-        prompt = (
+        prompt_text = (
             "Listen to this audio carefully and do three things:\n"
             "1. Identify the spoken language. The audio may be in any language. "
             "Return the full language name in English (e.g. English, Hindi, Spanish, Italian, French, Arabic, Urdu, etc.). "
@@ -564,16 +571,9 @@ def _transcribe_gemini(
             "TRANSCRIPT: <transcribed text in original language/script>\n"
             "TRANSLATION: <English translation (same as transcript if English)>"
         )
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[
-                types.Part.from_bytes(data=base64.b64decode(audio_b64), mime_type=mime_type),
-                prompt,
-            ],
-        )
-
-        raw = response.text.strip() if response.text else ""
+        raw = gemini_generate_text(
+            api_key, model_name,
+            [{"inline_data": {"mime_type": mime_type, "data": audio_b64}}, {"text": prompt_text}])
         if not raw:
             return {"success": False, "transcript": "", "error": "Gemini returned empty response"}
 
@@ -601,10 +601,7 @@ def _transcribe_gemini(
                     "(e.g. English, Hindi, Spanish, Italian, French, Arabic, Urdu, Maithili, Bhojpuri, etc.).\n\n"
                     f"Text: {transcript_text[:300]}"
                 )
-                fb_resp = client.models.generate_content(
-                    model=model_name, contents=[fallback_prompt]
-                )
-                fb_text = (fb_resp.text or "").strip().strip("*").strip()
+                fb_text = gemini_generate_text(api_key, model_name, [{"text": fallback_prompt}]).strip("*").strip()
                 if fb_text and len(fb_text) <= 40 and fb_text.replace("-", "").replace(" ", "").isalpha():
                     detected_language = fb_text.capitalize()
                     logger.info("Language fallback detected: %s", detected_language)
@@ -612,18 +609,15 @@ def _transcribe_gemini(
                 logger.warning("Language fallback detection failed: %s", _fb_err)
 
         if detected_language.lower() in ("bhojpuri", "maithili"):
-            detected_language = _verify_bhojpuri_maithili(
-                client, model_name, transcript_text, detected_language
-            )
+            detected_language = _verify_bhojpuri_maithili(api_key, model_name, transcript_text, detected_language)
 
         logger.info(
             "Transcribed %s via Gemini (%s, lang=%s, %d chars)",
             audio_path.name, model_name, detected_language or "unknown", len(transcript_text),
         )
-        # If no translation returned by model, fall back: English = same as transcript
-        if not translation_text:
-            if detected_language.lower() == "english":
-                translation_text = transcript_text
+        # If no translation returned by the model: English = same as transcript
+        if not translation_text and detected_language.lower() == "english":
+            translation_text = transcript_text
         result: Dict[str, Any] = {"success": True, "transcript": transcript_text, "provider": "gemini"}
         if detected_language:
             result["language"] = detected_language

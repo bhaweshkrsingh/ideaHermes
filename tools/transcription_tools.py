@@ -189,12 +189,10 @@ _has_deepinfra_key = _has_key("DEEPINFRA_API_KEY", "deepinfra", needs_openai=Tru
 
 
 def _has_gemini_key() -> bool:
-    """ideaHermes: google-genai installed AND a Gemini key (stt.gemini.api_key, GEMINI_API_KEY or GOOGLE_API_KEY)."""
-    if not _HAS_GOOGLE_GENAI:
-        return False
-    from hermes_cli.config import get_env_value
-    cfg = _get_stt_section(_load_stt_config(), "gemini")
-    return bool(cfg.get("api_key") or get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY"))
+    """ideaHermes: a Gemini key is resolvable (stt.gemini.api_key, GEMINI_API_KEY or GOOGLE_API_KEY). REST only: no SDK needed."""
+    from tools.transcription_cloud import gemini_api_key
+    return bool(gemini_api_key())
+
 
 # Cloud providers in AUTO-DETECT priority order:
 #   name -> (explicit-selection probe, auto-detect probe, explicit warning, auto-detect log)
@@ -224,8 +222,7 @@ _CLOUD_PROVIDER_SPECS = {
                   "No local STT available, using DeepInfra Whisper API"),
     # ideaHermes: LAST in auto-detect, so any keyed Whisper provider wins; explicit ``stt.provider: gemini`` always works.
     "gemini": (_has_gemini_key, _has_gemini_key,
-               "STT provider 'gemini' configured but google-genai not installed or no API key found "
-               "(set GEMINI_API_KEY or stt.gemini.api_key)",
+               "STT provider 'gemini' configured but no API key found (set GEMINI_API_KEY or stt.gemini.api_key)",
                "No local STT available, using Gemini Flash STT API")}
 
 # Explicit selections whose resolution is more than a probe + warning.

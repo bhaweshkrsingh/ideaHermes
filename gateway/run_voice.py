@@ -31,38 +31,24 @@ _VOICE_MODES = {"off", "voice_only", "all"}
 
 
 def _gemini_translate(text: str, target_language: str) -> str:
-    """Translate text to target_language using Gemini (module-level, safe for to_thread). ideaHermes addition."""
+    """Translate text to target_language with Gemini over REST (module-level, safe for to_thread). ideaHermes addition.
+    Returns the original text when no key is configured or the call fails (speaking the English answer beats silence)."""
     try:
-        from google import genai as _gai
-    except ImportError:
+        from tools.transcription_cloud import gemini_api_key, gemini_generate_text
+        api_key = gemini_api_key()
+        if not api_key:
+            return text
+        _script_hint = "Devanagari script (देवनागरी)" if target_language.lower() == "hindi" else "native script"
+        _prompt = (
+            f"Translate the following text to {target_language}. "
+            f"Use {_script_hint}. "
+            "Return ONLY the translated text, no explanations or extra text.\n\n"
+            f"{text[:3000]}"
+        )
+        return gemini_generate_text(api_key, "gemini-3.1-flash-lite", [{"text": _prompt}], timeout=30.0).strip() or text
+    except Exception as exc:  # noqa: BLE001 -- never block the reply on translation
+        logger.warning("Gemini translate failed (%s); using the original text", exc)
         return text
-    import os as _os_tr
-    _hermes_home = _os_tr.environ.get("HERMES_HOME", _os_tr.path.expanduser("~/.hermes"))
-    _api_key = _os_tr.environ.get("GEMINI_API_KEY", "")
-    if not _api_key:
-        try:
-            with open(_os_tr.path.join(_hermes_home, ".env")) as _ef:
-                for _ln in _ef:
-                    if _ln.strip().startswith("GEMINI_API_KEY="):
-                        _api_key = _ln.strip().split("=", 1)[1].strip()
-                        break
-        except Exception:
-            pass
-    if not _api_key:
-        return text
-    _script_hint = "Devanagari script (देवनागरी)" if target_language.lower() == "hindi" else "native script"
-    _prompt = (
-        f"Translate the following text to {target_language}. "
-        f"Use {_script_hint}. "
-        "Return ONLY the translated text, no explanations or extra text.\n\n"
-        f"{text[:3000]}"
-    )
-    _client = _gai.Client(api_key=_api_key)
-    _resp = _client.models.generate_content(
-        model="gemini-3.1-flash-lite",
-        contents=[_prompt],
-    )
-    return (_resp.text or "").strip() or text
 
 
 class GatewayVoiceMixin:
