@@ -473,6 +473,18 @@ class _PollingStallError(RuntimeError):
     """
 
 
+def _is_connect_failure(exc: BaseException) -> bool:
+    """True only when the TCP/TLS connection to Telegram could not be made (httpx.ConnectError / ConnectTimeout, possibly wrapped
+    in telegram.error.NetworkError). Nothing was sent, so repeating the request cannot duplicate a message."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if type(exc).__name__ in ("ConnectError", "ConnectTimeout"):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -5204,7 +5216,21 @@ class TelegramAdapter(BasePlatformAdapter):
             with open(audio_path, "rb") as audio_file:
                 ext = os.path.splitext(audio_path)[1].lower()
                 if ext in {".ogg", ".opus"}:  # round playable voice bubble
-                    msg = await self._send_voice_bubble(audio_file, chat_id, reply_to, metadata, caption, _duration_secs)
+                    # ideaHermes: a brief network blip (httpx.ConnectError, nothing reached Telegram) used to drop the voice note
+                    # to "couldn't deliver the audio attachment". Retry connection failures only, never timeouts or HTTP errors,
+                    # so a voice note can never be sent twice.
+                    for _attempt, _delay in enumerate((0.0, 2.0, 5.0)):
+                        if _delay:
+                            await asyncio.sleep(_delay)
+                            audio_file.seek(0)
+                        try:
+                            msg = await self._send_voice_bubble(audio_file, chat_id, reply_to, metadata, caption, _duration_secs)
+                            break
+                        except Exception as _net_err:
+                            if _attempt == 2 or not _is_connect_failure(_net_err):
+                                raise
+                            logger.warning("[%s] voice upload hit a connection error (attempt %d/3), retrying: %s",
+                                           self.name, _attempt + 1, _redact_telegram_error_text(_net_err))
                 elif ext in {".mp3", ".m4a"}:  # Bot API sendAudio only accepts MP3 / M4A
                     msg = await self._send_media(
                         self._bot.send_audio, chat_id, reply_to, metadata, "audio", reset_media=lambda: audio_file.seek(0),
