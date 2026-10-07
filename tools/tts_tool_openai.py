@@ -130,6 +130,10 @@ def _generate_openai_tts(
         "model": model, "voice": voice, "input": text,
         "response_format": _tts_response_format_from_path(output_path),
         "extra_headers": {"x-idempotency-key": str(uuid.uuid4())}}
+    if oai_config.get("response_format"):
+        # ideaHermes: servers that only emit wav/pcm (our Kokoro) reject the "opus" the .ogg path would ask for. Request what the
+        # server supports; the delivery step sniffs a WAV in a .ogg path and transcodes it to real Ogg/Opus (_repair_ogg_container).
+        create_kwargs["response_format"] = str(oai_config["response_format"])
     if speed != 1.0:
         create_kwargs["speed"] = max(0.25, min(4.0, speed))
     if instructions:

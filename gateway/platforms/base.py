@@ -4082,6 +4082,15 @@ class BasePlatformAdapter(ABC):
             from tools.tts_tool import text_to_speech_tool, check_tts_requirements
             if check_tts_requirements():
                 import json as _json
+                # ideaHermes: the agent answered in English; speak it in the language the user spoke (set by the gateway when
+                # the voice note was transcribed). Voice-input replies are produced HERE, not in the runner's _send_voice_reply.
+                _runner = getattr(self, "gateway_runner", None)
+                _target_lang = getattr(_runner, "_last_voice_target_lang", None)
+                if _runner is not None:
+                    _runner._last_voice_target_lang = None
+                if _target_lang and _target_lang.lower() != "english":
+                    from gateway.run_voice import _gemini_translate
+                    text_content = await asyncio.to_thread(_gemini_translate, text_content, _target_lang)
                 speech_text = self.prepare_tts_text(text_content)
                 if not speech_text:
                     raise ValueError("Empty text after markdown cleanup")
